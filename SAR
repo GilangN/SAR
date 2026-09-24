@@ -1,0 +1,1285 @@
+-- ==========================================
+-- SISTEM PEMBERSIHAN THREAD/KONEKSI LAMA
+-- ==========================================
+if getgenv().StealAnRich_Connections then
+    for _, conn in pairs(getgenv().StealAnRich_Connections) do
+        if typeof(conn) == "RBXScriptConnection" then
+            conn:Disconnect()
+        elseif typeof(conn) == "thread" then
+            task.cancel(conn)
+        end
+    end
+end
+
+getgenv().StealAnRich_Connections = {}
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Menggunakan CoreGui agar UI aman dari reset/game gui clearing
+local targetGuiParent = CoreGui
+local successCore, errCore = pcall(function()
+    return CoreGui:FindFirstChild("RobloxGui")
+end)
+if not successCore then
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+    targetGuiParent = playerGui
+end
+
+if targetGuiParent:FindFirstChild("StealAnRich_UI") then
+    targetGuiParent.StealAnRich_UI:Destroy()
+end
+
+local FOLDER_PATH = Workspace:WaitForChild("Crates")
+local CONFIG_FILE = "StealAnRich_Config.json"
+
+local globalEspEnabled = false
+local autoFarmEnabled = false
+local autoHopEnabled = false
+local autoTreadmillEnabled = false
+
+-- Variabel Fitur Feed Area & Custom Base Position
+local feedAreaEnabled = false
+local feedTargetPosition = nil
+local customBasePosition = nil
+
+-- Variabel Status Idle untuk Treadmill (7 Detik)
+local isBusyWithCrate = false
+local lastActionTick = tick()
+
+local VisitedServers = { [game.JobId] = true }
+
+local rarityToggles = {
+    ["Common"] = true,
+    ["Uncommon"] = true,
+    ["Rare"] = true,
+    ["Epic"] = true,
+    ["Legendary"] = true,
+    ["Mythic"] = true,
+    ["Cosmic"] = true,
+    ["Secret"] = true,
+    ["Divine"] = true -- Divine & Eternal digabungkan ke sini
+}
+
+local crateAutoToggles = {}
+
+local function saveSettings()
+    local configData = {
+        ESP = globalEspEnabled,
+        AutoFarm = autoFarmEnabled,
+        AutoHop = autoHopEnabled,
+        AutoTreadmill = autoTreadmillEnabled,
+        FeedArea = feedAreaEnabled,
+        FeedPos = feedTargetPosition and {feedTargetPosition.X, feedTargetPosition.Y, feedTargetPosition.Z} or nil,
+        BasePos = customBasePosition and {customBasePosition.X, customBasePosition.Y, customBasePosition.Z} or nil,
+        RarityToggles = rarityToggles,
+        CrateAutoToggles = crateAutoToggles
+    }
+    
+    local success, encoded = pcall(function()
+        return HttpService:JSONEncode(configData)
+    end)
+    
+    if success and writefile then
+        pcall(function()
+            writefile(CONFIG_FILE, encoded)
+        end)
+    end
+end
+
+local function loadSettings()
+    if readfile and isfile and isfile(CONFIG_FILE) then
+        local success, decoded = pcall(function()
+            return HttpService:JSONDecode(readfile(CONFIG_FILE))
+        end)
+        
+        if success and decoded then
+            if decoded.ESP ~= nil then globalEspEnabled = decoded.ESP end
+            if decoded.AutoFarm ~= nil then autoFarmEnabled = decoded.AutoFarm end
+            if decoded.AutoHop ~= nil then autoHopEnabled = decoded.AutoHop end
+            if decoded.AutoTreadmill ~= nil then autoTreadmillEnabled = decoded.AutoTreadmill end
+            if decoded.FeedArea ~= nil then feedAreaEnabled = decoded.FeedArea end
+            if decoded.FeedPos ~= nil and type(decoded.FeedPos) == "table" then
+                feedTargetPosition = Vector3.new(decoded.FeedPos[1], decoded.FeedPos[2], decoded.FeedPos[3])
+            end
+            if decoded.BasePos ~= nil and type(decoded.BasePos) == "table" then
+                customBasePosition = Vector3.new(decoded.BasePos[1], decoded.BasePos[2], decoded.BasePos[3])
+            end
+            if decoded.RarityToggles ~= nil then
+                for rarity, state in pairs(decoded.RarityToggles) do
+                    if rarityToggles[rarity] ~= nil then
+                        rarityToggles[rarity] = state
+                    end
+                end
+            end
+            if decoded.CrateAutoToggles ~= nil then
+                for crateName, state in pairs(decoded.CrateAutoToggles) do
+                    crateAutoToggles[crateName] = state
+                end
+            end
+        end
+    end
+end
+
+loadSettings()
+
+local function setupQueueOnTeleport()
+    if autoHopEnabled and queue_on_teleport then
+        pcall(function()
+            queue_on_teleport([[
+                task.wait(3)
+                loadstring(game:HttpGet("https://raw.githubusercontent.com/GilangN/SAR/refs/heads/main/SAR"))()
+            ]])
+        end)
+    end
+end
+
+local function hopServer()
+    setupQueueOnTeleport()
+    VisitedServers[game.JobId] = true
+
+    local success, err = pcall(function()
+        local servers = {}
+        local cursor = ""
+        local attempts = 0
+        
+        repeat
+            attempts = attempts + 1
+            local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"
+            if cursor ~= "" then
+                url = url .. "&cursor=" .. cursor
+            end
+            
+            local reqSucc, response = pcall(function()
+                return game:HttpGet(url)
+            end)
+            
+            if not reqSucc or not response then break end
+            
+            local req = HttpService:JSONDecode(response)
+            cursor = req.nextPageCursor
+            
+            if req.data then
+                for _, server in ipairs(req.data) do
+                    if server.playing and server.maxPlayers and server.playing < server.maxPlayers then
+                        if not VisitedServers[server.id] then
+                            table.insert(servers, server)
+                        end
+                    end
+                end
+            end
+            
+        until not cursor or #servers > 0 or attempts > 3
+        
+        table.sort(servers, function(a, b)
+            return a.playing < b.playing
+        end)
+        
+        if #servers > 0 then
+            local targetServer = servers[1]
+            VisitedServers[targetServer.id] = true
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, targetServer.id, LocalPlayer)
+        else
+            VisitedServers = {} 
+            TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        end
+    end)
+    
+    if not success then
+        TeleportService:Teleport(game.PlaceId, LocalPlayer)
+    end
+end
+
+-- Urutan Bobot Rarity (Divine / Eternal digabung jadi nilai tertinggi)
+local rarityWeights = {
+    ["Divine"] = 10,
+    ["Secret"] = 8,
+    ["Cosmic"] = 7,
+    ["Mythic"] = 6,
+    ["Legendary"] = 5,
+    ["Epic"] = 4,
+    ["Rare"] = 3,
+    ["Uncommon"] = 2,
+    ["Common"] = 1
+}
+
+local function getCrateRarity(item)
+    local tier = item:GetAttribute("CrateTier")
+    if not tier then
+        local val = item:FindFirstChild("CrateTier")
+        if val then tier = val.Value end
+    end
+    local strTier = tostring(tier or "Common")
+    if strTier == "Eternal" then
+        return "Divine"
+    end
+    return strTier
+end
+
+local function getCrateName(item)
+    local areaId = item:GetAttribute("AreaId")
+    if not areaId then
+        local val = item:FindFirstChild("AreaId")
+        if val then areaId = val.Value end
+    end
+    return tostring(areaId or item.Name)
+end
+
+local function getCratePart(item)
+    if item:IsA("BasePart") then
+        return item
+    elseif item:IsA("Model") then
+        return item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart")
+    end
+    return nil
+end
+
+local function getCrateDistance(item)
+    local part = getCratePart(item)
+    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if part and hrp then
+        return (hrp.Position - part.Position).Magnitude
+    end
+    return math.huge
+end
+
+local function getCrateWeight(item)
+    local weightAttr = item:GetAttribute("CrateKg") or item:GetAttribute("Weight") or item:GetAttribute("KG") or item:GetAttribute("Mass")
+    if type(weightAttr) == "number" then return weightAttr end
+
+    for _, desc in ipairs(item:GetDescendants()) do
+        if desc.Name == "CrateKg" or desc.Name == "Weight" or desc.Name == "KG" or desc.Name == "Mass" then
+            if desc:IsA("NumberValue") or desc:IsA("IntValue") then
+                return desc.Value
+            elseif desc:IsA("StringValue") then
+                local num = tonumber(string.match(desc.Value, "%d+%.?%d*"))
+                if num then return num end
+            end
+        end
+    end
+
+    if item:IsA("Model") then
+        local ok, size = pcall(function() return item:GetExtentsSize() end)
+        if ok and size then return size.Magnitude end
+    end
+    
+    local part = getCratePart(item)
+    return part and part.Size.Magnitude or 0
+end
+
+local function instantPrompt(item)
+    if item:IsA("ProximityPrompt") then item.HoldDuration = 0 end
+    for _, desc in ipairs(item:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") then desc.HoldDuration = 0 end
+    end
+end
+
+for _, descendant in ipairs(Workspace:GetDescendants()) do
+    instantPrompt(descendant)
+end
+
+local descConn = Workspace.DescendantAdded:Connect(function(descendant)
+    task.spawn(function()
+        task.wait(0.1)
+        instantPrompt(descendant)
+    end)
+end)
+table.insert(getgenv().StealAnRich_Connections, descConn)
+
+local function removeESP(item)
+    if item:FindFirstChild("CrateESP_Gui") then item.CrateESP_Gui:Destroy() end
+    if item:FindFirstChild("CrateESP_Highlight") then item.CrateESP_Highlight:Destroy() end
+end
+
+local function clearAllESP()
+    for _, item in ipairs(FOLDER_PATH:GetChildren()) do
+        local part = getCratePart(item)
+        if part then removeESP(part) end
+        if item:IsA("Model") then removeESP(item) end
+    end
+end
+
+local function addOutline(parent, thickness)
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = thickness or 2
+    stroke.Color = Color3.fromRGB(0, 0, 0)
+    stroke.Parent = parent
+    return stroke
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "StealAnRich_UI"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 2147483647
+
+if protectgui then
+    pcall(function()
+        protectgui(screenGui)
+    end)
+end
+
+screenGui.Parent = targetGuiParent
+
+local floatingIcon = Instance.new("TextButton", screenGui)
+floatingIcon.Name = "FloatingIcon"
+floatingIcon.Size = UDim2.new(0, 45, 0, 45)
+floatingIcon.Position = UDim2.new(0.05, 0, 0.15, 0)
+floatingIcon.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+floatingIcon.TextColor3 = Color3.fromRGB(255, 255, 255)
+floatingIcon.TextSize = 13
+floatingIcon.Font = Enum.Font.SourceSansBold
+floatingIcon.Text = "CRATE"
+floatingIcon.Active = true
+floatingIcon.Draggable = true
+addOutline(floatingIcon, 2)
+Instance.new("UICorner", floatingIcon).CornerRadius = UDim.new(1, 0)
+
+local mainFrame = Instance.new("Frame", screenGui)
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.new(0, 520, 0, 400)
+mainFrame.Position = UDim2.new(0.05, 0, 0.22, 0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+mainFrame.BackgroundTransparency = 0.2
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+addOutline(mainFrame, 2.5)
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+
+local dragging, dragInput, dragStart, startPos
+mainFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = mainFrame.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+
+mainFrame.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+
+local resizeButton = Instance.new("TextButton", mainFrame)
+resizeButton.Size = UDim2.new(0, 15, 0, 15)
+resizeButton.Position = UDim2.new(1, -15, 1, -15)
+resizeButton.BackgroundTransparency = 1
+resizeButton.Text = ""
+resizeButton.Active = true
+
+local resizing, resizeStart, startSize
+resizeButton.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        resizing = true
+        resizeStart = input.Position
+        startSize = mainFrame.AbsoluteSize
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then resizing = false end
+        end)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if resizing and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - resizeStart
+        mainFrame.Size = UDim2.new(0, math.clamp(startSize.X + delta.X, 400, 800), 0, math.clamp(startSize.Y + delta.Y, 300, 600))
+    end
+end)
+
+local titleBar = Instance.new("Frame", mainFrame)
+titleBar.Size = UDim2.new(1, 0, 0, 30)
+titleBar.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+titleBar.BackgroundTransparency = 0.2
+titleBar.BorderSizePixel = 0
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 8)
+
+local titleText = Instance.new("TextLabel", titleBar)
+titleText.Size = UDim2.new(1, -70, 1, 0)
+titleText.Position = UDim2.new(0, 8, 0, 0)
+titleText.BackgroundTransparency = 1
+titleText.TextColor3 = Color3.fromRGB(255, 255, 255)
+titleText.TextSize = 13
+titleText.Font = Enum.Font.SourceSansBold
+titleText.Text = "Steal and Rich - Crates"
+titleText.TextXAlignment = Enum.TextXAlignment.Left
+
+local closeButton = Instance.new("TextButton", titleBar)
+closeButton.Size = UDim2.new(0, 24, 0, 24)
+closeButton.Position = UDim2.new(1, -27, 0, 3)
+closeButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+closeButton.BackgroundTransparency = 0.2
+closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+closeButton.TextSize = 12
+closeButton.Font = Enum.Font.SourceSansBold
+closeButton.Text = "X"
+Instance.new("UICorner", closeButton).CornerRadius = UDim.new(0, 4)
+
+local hideButton = Instance.new("TextButton", titleBar)
+hideButton.Size = UDim2.new(0, 24, 0, 24)
+hideButton.Position = UDim2.new(1, -55, 0, 3)
+hideButton.BackgroundColor3 = Color3.fromRGB(100, 100, 100)
+hideButton.BackgroundTransparency = 0.2
+hideButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+hideButton.TextSize = 12
+hideButton.Font = Enum.Font.SourceSansBold
+hideButton.Text = "-"
+Instance.new("UICorner", hideButton).CornerRadius = UDim.new(0, 4)
+
+local contentFrame = Instance.new("Frame", mainFrame)
+contentFrame.Size = UDim2.new(1, -16, 1, -45)
+contentFrame.Position = UDim2.new(0, 8, 0, 38)
+contentFrame.BackgroundTransparency = 1
+
+local leftPanel = Instance.new("Frame", contentFrame)
+leftPanel.Size = UDim2.new(0, 215, 1, 0)
+leftPanel.BackgroundTransparency = 1
+
+local toggleButton = Instance.new("TextButton", leftPanel)
+toggleButton.Size = UDim2.new(1, -4, 0, 28)
+toggleButton.Position = UDim2.new(0, 0, 0, 0)
+toggleButton.BackgroundColor3 = globalEspEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+toggleButton.BackgroundTransparency = 0.2
+toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleButton.TextSize = 12
+toggleButton.Font = Enum.Font.SourceSansBold
+toggleButton.Text = globalEspEnabled and "ESP: ON" or "ESP: OFF"
+Instance.new("UICorner", toggleButton).CornerRadius = UDim.new(0, 6)
+
+local baseContainer = Instance.new("Frame", leftPanel)
+baseContainer.Size = UDim2.new(1, -4, 0, 28)
+baseContainer.Position = UDim2.new(0, 0, 0, 32)
+baseContainer.BackgroundTransparency = 1
+
+local setBaseButton = Instance.new("TextButton", baseContainer)
+setBaseButton.Size = UDim2.new(0.48, 0, 1, 0)
+setBaseButton.Position = UDim2.new(0, 0, 0, 0)
+setBaseButton.BackgroundColor3 = Color3.fromRGB(80, 200, 80)
+setBaseButton.BackgroundTransparency = 0.2
+setBaseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+setBaseButton.TextSize = 10
+setBaseButton.Font = Enum.Font.SourceSansBold
+setBaseButton.Text = "Set Base Pos"
+Instance.new("UICorner", setBaseButton).CornerRadius = UDim.new(0, 6)
+
+local tpBaseButton = Instance.new("TextButton", baseContainer)
+tpBaseButton.Size = UDim2.new(0.48, 0, 1, 0)
+tpBaseButton.Position = UDim2.new(0.52, 0, 0, 0)
+tpBaseButton.BackgroundColor3 = Color3.fromRGB(60, 120, 200)
+tpBaseButton.BackgroundTransparency = 0.2
+tpBaseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+tpBaseButton.TextSize = 10
+tpBaseButton.Font = Enum.Font.SourceSansBold
+tpBaseButton.Text = "TP to Base"
+Instance.new("UICorner", tpBaseButton).CornerRadius = UDim.new(0, 6)
+
+-- Auto Farm & Auto Treadmill berdampingan di baris ke-3
+local farmContainer = Instance.new("Frame", leftPanel)
+farmContainer.Size = UDim2.new(1, -4, 0, 28)
+farmContainer.Position = UDim2.new(0, 0, 0, 64)
+farmContainer.BackgroundTransparency = 1
+
+local autoFarmButton = Instance.new("TextButton", farmContainer)
+autoFarmButton.Size = UDim2.new(0.48, 0, 1, 0)
+autoFarmButton.Position = UDim2.new(0, 0, 0, 0)
+autoFarmButton.BackgroundColor3 = autoFarmEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+autoFarmButton.BackgroundTransparency = 0.2
+autoFarmButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+autoFarmButton.TextSize = 10
+autoFarmButton.Font = Enum.Font.SourceSansBold
+autoFarmButton.Text = autoFarmEnabled and "Auto Farm: ON" or "Auto Farm: OFF"
+Instance.new("UICorner", autoFarmButton).CornerRadius = UDim.new(0, 6)
+
+local autoTreadmillButton = Instance.new("TextButton", farmContainer)
+autoTreadmillButton.Size = UDim2.new(0.48, 0, 1, 0)
+autoTreadmillButton.Position = UDim2.new(0.52, 0, 0, 0)
+autoTreadmillButton.BackgroundColor3 = autoTreadmillEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+autoTreadmillButton.BackgroundTransparency = 0.2
+autoTreadmillButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+autoTreadmillButton.TextSize = 10
+autoTreadmillButton.Font = Enum.Font.SourceSansBold
+autoTreadmillButton.Text = autoTreadmillEnabled and "Auto Treadmill: ON" or "Auto Treadmill: OFF"
+Instance.new("UICorner", autoTreadmillButton).CornerRadius = UDim.new(0, 6)
+
+local feedContainer = Instance.new("Frame", leftPanel)
+feedContainer.Size = UDim2.new(1, -4, 0, 28)
+feedContainer.Position = UDim2.new(0, 0, 0, 96)
+feedContainer.BackgroundTransparency = 1
+
+local feedToggleButton = Instance.new("TextButton", feedContainer)
+feedToggleButton.Size = UDim2.new(0.48, 0, 1, 0)
+feedToggleButton.Position = UDim2.new(0, 0, 0, 0)
+feedToggleButton.BackgroundColor3 = feedAreaEnabled and Color3.fromRGB(230, 126, 34) or Color3.fromRGB(120, 0, 0)
+feedToggleButton.BackgroundTransparency = 0.2
+feedToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+feedToggleButton.TextSize = 10
+feedToggleButton.Font = Enum.Font.SourceSansBold
+feedToggleButton.Text = feedAreaEnabled and "Feed Area: ON" or "Feed Area: OFF"
+Instance.new("UICorner", feedToggleButton).CornerRadius = UDim.new(0, 6)
+
+local setPosButton = Instance.new("TextButton", feedContainer)
+setPosButton.Size = UDim2.new(0.48, 0, 1, 0)
+setPosButton.Position = UDim2.new(0.52, 0, 0, 0)
+setPosButton.BackgroundColor3 = Color3.fromRGB(230, 126, 34)
+setPosButton.BackgroundTransparency = 0.2
+setPosButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+setPosButton.TextSize = 10
+setPosButton.Font = Enum.Font.SourceSansBold
+setPosButton.Text = "Set Feed Pos"
+Instance.new("UICorner", setPosButton).CornerRadius = UDim.new(0, 6)
+
+local hopContainer = Instance.new("Frame", leftPanel)
+hopContainer.Size = UDim2.new(1, -4, 0, 28)
+hopContainer.Position = UDim2.new(0, 0, 0, 128)
+hopContainer.BackgroundTransparency = 1
+
+local hopButton = Instance.new("TextButton", hopContainer)
+hopButton.Size = UDim2.new(0.48, 0, 1, 0)
+hopButton.Position = UDim2.new(0, 0, 0, 0)
+hopButton.BackgroundColor3 = Color3.fromRGB(138, 43, 226)
+hopButton.BackgroundTransparency = 0.2
+hopButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+hopButton.TextSize = 10
+hopButton.Font = Enum.Font.SourceSansBold
+hopButton.Text = "HOP SERVER"
+Instance.new("UICorner", hopButton).CornerRadius = UDim.new(0, 6)
+
+local autoHopButton = Instance.new("TextButton", hopContainer)
+autoHopButton.Size = UDim2.new(0.48, 0, 1, 0)
+autoHopButton.Position = UDim2.new(0.52, 0, 0, 0)
+autoHopButton.BackgroundColor3 = autoHopEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+autoHopButton.BackgroundTransparency = 0.2
+autoHopButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+autoHopButton.TextSize = 10
+autoHopButton.Font = Enum.Font.SourceSansBold
+autoHopButton.Text = autoHopEnabled and "Auto Execute: ON" or "Auto Execute: OFF"
+Instance.new("UICorner", autoHopButton).CornerRadius = UDim.new(0, 6)
+
+local rarityLabel = Instance.new("TextLabel", leftPanel)
+rarityLabel.Size = UDim2.new(0.48, 0, 0, 20)
+rarityLabel.Position = UDim2.new(0, 0, 0, 162)
+rarityLabel.BackgroundTransparency = 1
+rarityLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+rarityLabel.TextSize = 11
+rarityLabel.Font = Enum.Font.SourceSansBold
+rarityLabel.Text = "Rarity:"
+rarityLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local crateFilterLabel = Instance.new("TextLabel", leftPanel)
+crateFilterLabel.Size = UDim2.new(0.48, 0, 0, 20)
+crateFilterLabel.Position = UDim2.new(0.52, 0, 0, 162)
+crateFilterLabel.BackgroundTransparency = 1
+crateFilterLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+crateFilterLabel.TextSize = 11
+crateFilterLabel.Font = Enum.Font.SourceSansBold
+crateFilterLabel.Text = "Crate Filter:"
+crateFilterLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local rarityScroll = Instance.new("ScrollingFrame", leftPanel)
+rarityScroll.Size = UDim2.new(0.48, 0, 1, -190)
+rarityScroll.Position = UDim2.new(0, 0, 0, 186)
+rarityScroll.BackgroundTransparency = 1
+rarityScroll.BorderSizePixel = 0
+rarityScroll.CanvasSize = UDim2.new(0, 0, 0, 300)
+rarityScroll.ScrollBarThickness = 3
+
+local crateFilterScroll = Instance.new("ScrollingFrame", leftPanel)
+crateFilterScroll.Size = UDim2.new(0.48, 0, 1, -190)
+crateFilterScroll.Position = UDim2.new(0.52, 0, 0, 186)
+crateFilterScroll.BackgroundTransparency = 1
+crateFilterScroll.BorderSizePixel = 0
+crateFilterScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+crateFilterScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+crateFilterScroll.ScrollBarThickness = 3
+
+local crateFilterLayout = Instance.new("UIListLayout", crateFilterScroll)
+crateFilterLayout.SortOrder = Enum.SortOrder.LayoutOrder
+crateFilterLayout.Padding = UDim.new(0, 4)
+
+local rightPanel = Instance.new("Frame", contentFrame)
+rightPanel.Size = UDim2.new(1, -225, 1, 0)
+rightPanel.Position = UDim2.new(0, 225, 0, 0)
+rightPanel.BackgroundTransparency = 1
+
+local scrollList = Instance.new("ScrollingFrame", rightPanel)
+scrollList.Size = UDim2.new(1, 0, 1, 0)
+scrollList.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+scrollList.BackgroundTransparency = 0.35
+scrollList.BorderSizePixel = 0
+scrollList.CanvasSize = UDim2.new(0, 0, 0, 0)
+scrollList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Instance.new("UICorner", scrollList).CornerRadius = UDim.new(0, 6)
+
+local uiListLayout = Instance.new("UIListLayout", scrollList)
+uiListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+uiListLayout.Padding = UDim.new(0, 2)
+
+local function getRarityBaseColor(rarity)
+    if rarity == "Common" then return Color3.fromRGB(255, 255, 255)
+    elseif rarity == "Uncommon" then return Color3.fromRGB(50, 205, 50)
+    elseif rarity == "Rare" then return Color3.fromRGB(0, 120, 255)
+    elseif rarity == "Epic" then return Color3.fromRGB(186, 85, 211)
+    elseif rarity == "Legendary" then return Color3.fromRGB(255, 140, 0)
+    elseif rarity == "Mythic" then return Color3.fromRGB(255, 0, 0)
+    elseif rarity == "Cosmic" then return Color3.fromRGB(75, 0, 130)
+    elseif rarity == "Secret" then return Color3.fromRGB(100, 100, 100)
+    elseif rarity == "Divine" then return Color3.fromRGB(255, 220, 50) end
+    return Color3.fromRGB(255, 255, 255)
+end
+
+local function setupESP(item)
+    local targetPart = getCratePart(item)
+    if not targetPart then return end
+
+    local crateName = getCrateName(item)
+    local crateRarity = getCrateRarity(item)
+
+    if not globalEspEnabled or not rarityToggles[crateRarity] then
+        removeESP(item)
+        return
+    end
+
+    removeESP(item)
+
+    local baseColor = getRarityBaseColor(crateRarity)
+
+    local highlight = Instance.new("Highlight", item)
+    highlight.Name = "CrateESP_Highlight"
+    highlight.Adornee = item
+    highlight.FillColor = baseColor
+    highlight.FillTransparency = 0.5
+    highlight.OutlineTransparency = 1
+
+    local billboard = Instance.new("BillboardGui", item)
+    billboard.Name = "CrateESP_Gui"
+    billboard.Size = UDim2.new(0, 140, 0, 45)
+    billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Adornee = targetPart
+
+    local nameLabel = Instance.new("TextLabel", billboard)
+    nameLabel.Name = "ESPNameText"
+    nameLabel.Size = UDim2.new(1, 0, 0, 22)
+    nameLabel.Position = UDim2.new(0, 0, 0, 0)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.TextColor3 = baseColor
+    nameLabel.TextStrokeTransparency = 0
+    nameLabel.TextSize = 15
+    nameLabel.Font = Enum.Font.SourceSansBold
+    nameLabel.Text = crateName
+
+    local distLabel = Instance.new("TextLabel", billboard)
+    distLabel.Name = "ESPDistText"
+    distLabel.Size = UDim2.new(1, 0, 0, 16)
+    distLabel.Position = UDim2.new(0, 0, 0, 20)
+    distLabel.BackgroundTransparency = 1
+    distLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    distLabel.TextStrokeTransparency = 0
+    distLabel.TextSize = 10
+    distLabel.Font = Enum.Font.SourceSansBold
+    distLabel.Text = "< ? m >"
+
+    local espThread = task.spawn(function()
+        local tickCount = 0
+        while billboard and billboard.Parent and targetPart and targetPart.Parent and globalEspEnabled and rarityToggles[crateRarity] do
+            tickCount = tickCount + 0.1
+            
+            if crateRarity == "Divine" then
+                local tVal = (math.sin(tickCount * 3) + 1) / 2
+                local dynamicColor = Color3.fromRGB(255, 180, 0):Lerp(Color3.fromRGB(0, 200, 255), tVal)
+                nameLabel.TextColor3 = dynamicColor
+                highlight.FillColor = dynamicColor
+            end
+
+            local character = LocalPlayer.Character
+            if character and character:FindFirstChild("HumanoidRootPart") then
+                local distance = (character.HumanoidRootPart.Position - targetPart.Position).Magnitude
+                distLabel.Text = string.format("< %d m >", math.floor(distance))
+            else
+                distLabel.Text = "[Jarak: ?]"
+            end
+            task.wait(0.1)
+        end
+    end)
+    table.insert(getgenv().StealAnRich_Connections, espThread)
+end
+
+local function refreshAllESP()
+    for _, item in ipairs(FOLDER_PATH:GetChildren()) do
+        setupESP(item)
+    end
+end
+
+local function triggerPrompts(target)
+    if target:IsA("ProximityPrompt") then fireproximityprompt(target) end
+    local descendants = target:GetDescendants()
+    for i = 1, #descendants do
+        local desc = descendants[i]
+        if desc:IsA("ProximityPrompt") then fireproximityprompt(desc) end
+    end
+end
+
+local function hasActivePrompt(item)
+    if not item or not item.Parent then return false end
+    if item:IsA("ProximityPrompt") and item.Enabled then return true end
+    for _, desc in ipairs(item:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") and desc.Enabled then
+            return true
+        end
+    end
+    return false
+end
+
+-- Fungsi Helper untuk Dismount & TP ke Kanan jika Auto Treadmill Menyala
+local function checkAndDismountTreadmill()
+    if autoTreadmillEnabled then
+        pcall(function()
+            local character = LocalPlayer.Character
+            if character then
+                local hrp = character:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    hrp.CFrame = hrp.CFrame + (hrp.CFrame.RightVector * 5)
+                end
+            end
+            
+            local dismountEvent = ReplicatedStorage:FindFirstChild("Shared") 
+                and ReplicatedStorage.Shared.Packages 
+                and ReplicatedStorage.Shared.Packages.Network 
+                and ReplicatedStorage.Shared.Packages.Network:FindFirstChild("rev_TREADMILL_DISMOUNT")
+            if dismountEvent then
+                dismountEvent:FireServer()
+            end
+        end)
+        task.wait(0.1)
+    end
+end
+
+-- Proses Otomatis Koleksi Crate Sesuai Alur 5 Langkah Anda
+local function processCrateCollection(item)
+    if not item or not item.Parent then return end
+    
+    local character = LocalPlayer.Character
+    if not character or not character:FindFirstChild("HumanoidRootPart") then return end
+    
+    checkAndDismountTreadmill()
+
+    isBusyWithCrate = true
+    lastActionTick = tick()
+
+    local hrp = character.HumanoidRootPart
+    local originalPosition = customBasePosition and CFrame.new(customBasePosition) or hrp.CFrame
+
+    -- Langkah 1: Target/tujuan yang dipilih (item) sudah diingat.
+
+    -- Langkah 2: Cari crate berjarak paling dekat dari player saat ini (murni fisik terdekat untuk trigger guard)
+    local closestCrate = nil
+    local shortestDist = math.huge
+    for _, child in ipairs(FOLDER_PATH:GetChildren()) do
+        if hasActivePrompt(child) and getCratePart(child) then
+            local dist = getCrateDistance(child)
+            if dist < shortestDist then
+                shortestDist = dist
+                closestCrate = child
+            end
+        end
+    end
+
+    local baitCrate = closestCrate or item
+    local baitPart = getCratePart(baitCrate)
+
+    if baitPart then
+        local baitCF = baitPart.CFrame + Vector3.new(0, 3, 0)
+        local distBait = (hrp.Position - baitCF.Position).Magnitude
+        local durBait = math.clamp(distBait / 250, 0.2, 1.5)
+        
+        local tweenBait = TweenService:Create(hrp, TweenInfo.new(durBait, Enum.EasingStyle.Linear), {CFrame = baitCF})
+        tweenBait:Play()
+        tweenBait.Completed:Wait()
+
+        local pickStart = tick()
+        while baitCrate and baitCrate.Parent == FOLDER_PATH and (tick() - pickStart < 3) do
+            triggerPrompts(baitCrate)
+            task.wait(0.05)
+        end
+
+        -- Diam tunggu sampai terlempar oleh guard / crate terlepas
+        while baitCrate do
+            local parent = baitCrate.Parent
+            if parent == FOLDER_PATH or parent == nil then
+                break
+            end
+            if hrp.AssemblyLinearVelocity.Magnitude > 45 then
+                break
+            end
+            task.wait(0.05)
+        end
+    end
+
+    -- Langkah 3 & 4: Ketika sudah terlempar, tunggu beberapa saat hingga proximity crate pilihan muncul, lalu teleport & ambil
+    if item and item.Parent == FOLDER_PATH then
+        local waitPromptStart = tick()
+        while item and item.Parent == FOLDER_PATH and not hasActivePrompt(item) and (tick() - waitPromptStart < 5) do
+            task.wait(0.05)
+        end
+
+        local targetPart = getCratePart(item)
+        if targetPart then
+            hrp.CFrame = targetPart.CFrame + Vector3.new(0, 3, 0)
+
+            while item and item.Parent == FOLDER_PATH and hasActivePrompt(item) do
+                triggerPrompts(item)
+                task.wait(0.05)
+            end
+
+            -- Langkah 5: Jika Feed aktif tetap tween ke posisi feed (dengan pemantauan jika crate terlepas di tengah jalan), jika tidak aktif (Base) langsung teleport
+            if feedAreaEnabled and feedTargetPosition then
+                local feedCF = CFrame.new(feedTargetPosition)
+                local feedDist = (hrp.Position - feedTargetPosition).Magnitude
+                local feedDuration = math.clamp(feedDist / 250, 1.0, 7.0)
+                
+                local feedTween = TweenService:Create(hrp, TweenInfo.new(feedDuration, Enum.EasingStyle.Linear), {CFrame = feedCF})
+                feedTween:Play()
+                
+                local interrupted = false
+                while feedTween.PlaybackState == Enum.PlaybackState.Playing do
+                    if item and item.Parent == FOLDER_PATH and hasActivePrompt(item) then
+                        interrupted = true
+                        feedTween:Cancel()
+                        break
+                    end
+                    task.wait(0.05)
+                end
+                
+                -- Jika di tengah jalan crate terlepas/aktif kembali proximitynya, hentikan tween dan ulangi dari posisi berhenti
+                if interrupted then
+                    return processCrateCollection(item)
+                end
+                
+                pcall(function()
+                    local dropEvent = ReplicatedStorage:FindFirstChild("Shared") 
+                        and ReplicatedStorage.Shared.Packages 
+                        and ReplicatedStorage.Shared.Packages.Network 
+                        and ReplicatedStorage.Shared.Packages.Network:FindFirstChild("rev_CRATE_DROP")
+                    if dropEvent then
+                        dropEvent:FireServer()
+                    end
+                end)
+            else
+                hrp.CFrame = originalPosition
+            end
+        end
+    else
+        hrp.CFrame = originalPosition
+    end
+
+    isBusyWithCrate = false
+    lastActionTick = tick()
+end
+
+local updateCrateFilterUI
+
+local updateQueued = false
+local function updateUIList()
+    if updateQueued then return end
+    updateQueued = true
+
+    local t = task.spawn(function()
+        task.wait(0.15)
+        updateQueued = false
+
+        local children = scrollList:GetChildren()
+        for i = 1, #children do
+            local child = children[i]
+            if child:IsA("Frame") then child:Destroy() end
+        end
+
+        local crateChildren = FOLDER_PATH:GetChildren()
+
+        -- Urutkan berdasarkan Rarity Tertinggi (Divine ke Common), lalu Ukuran/Bobot, lalu Nama
+        table.sort(crateChildren, function(a, b)
+            local weightA = rarityWeights[getCrateRarity(a)] or 0
+            local weightB = rarityWeights[getCrateRarity(b)] or 0
+            if weightA ~= weightB then return weightA > weightB end
+            
+            local sizeA, sizeB = getCrateWeight(a), getCrateWeight(b)
+            if sizeA ~= sizeB then return sizeA > sizeB end
+            
+            return getCrateName(a) < getCrateName(b)
+        end)
+
+        for i = 1, #crateChildren do
+            local item = crateChildren[i]
+            local crateName = getCrateName(item)
+            local crateRarity = getCrateRarity(item)
+
+            if rarityToggles[crateRarity] then
+                local rowFrame = Instance.new("Frame", scrollList)
+                rowFrame.Size = UDim2.new(1, -6, 0, 26)
+                rowFrame.BackgroundTransparency = 1
+
+                local infoLabel = Instance.new("TextLabel", rowFrame)
+                infoLabel.Size = UDim2.new(1, -72, 1, 0)
+                infoLabel.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+                infoLabel.BackgroundTransparency = 0.25
+                infoLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+                infoLabel.TextSize = 11
+                infoLabel.Font = Enum.Font.SourceSansBold
+                infoLabel.Text = " " .. crateName .. " [" .. crateRarity .. "]"
+                infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+                Instance.new("UICorner", infoLabel).CornerRadius = UDim.new(0, 4)
+
+                local tpButton = Instance.new("TextButton", rowFrame)
+                tpButton.Size = UDim2.new(0, 30, 1, 0)
+                tpButton.Position = UDim2.new(1, -68, 0, 0)
+                tpButton.BackgroundColor3 = Color3.fromRGB(60, 60, 180)
+                tpButton.BackgroundTransparency = 0.2
+                tpButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+                tpButton.TextSize = 11
+                tpButton.Font = Enum.Font.SourceSansBold
+                tpButton.Text = "TP"
+                Instance.new("UICorner", tpButton).CornerRadius = UDim.new(0, 4)
+
+                tpButton.MouseButton1Click:Connect(function()
+                    if item and item.Parent then
+                        local part = getCratePart(item)
+                        if part and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                            checkAndDismountTreadmill()
+                            LocalPlayer.Character.HumanoidRootPart.CFrame = part.CFrame + Vector3.new(0, 5, 0)
+                        end
+                    end
+                end)
+
+                local autoButton = Instance.new("TextButton", rowFrame)
+                autoButton.Size = UDim2.new(0, 34, 1, 0)
+                autoButton.Position = UDim2.new(1, -34, 0, 0)
+                autoButton.BackgroundColor3 = Color3.fromRGB(0, 170, 255)
+                autoButton.BackgroundTransparency = 0.2
+                autoButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+                autoButton.TextSize = 10
+                autoButton.Font = Enum.Font.SourceSansBold
+                autoButton.Text = "Auto"
+                Instance.new("UICorner", autoButton).CornerRadius = UDim.new(0, 4)
+
+                autoButton.MouseButton1Click:Connect(function()
+                    task.spawn(function() processCrateCollection(item) end)
+                end)
+            end
+        end
+    end)
+    table.insert(getgenv().StealAnRich_Connections, t)
+end
+
+updateCrateFilterUI = function()
+    local children = crateFilterScroll:GetChildren()
+    for i = 1, #children do
+        local child = children[i]
+        if child:IsA("Frame") then child:Destroy() end
+    end
+
+    local uniqueCrates = {}
+    local seen = {}
+    for _, item in ipairs(FOLDER_PATH:GetChildren()) do
+        local cName = getCrateName(item)
+        local cRarity = getCrateRarity(item)
+        if rarityToggles[cRarity] and not seen[cName] then
+            seen[cName] = true
+            table.insert(uniqueCrates, cName)
+        end
+    end
+
+    table.sort(uniqueCrates, function(a, b)
+        return a < b
+    end)
+
+    for i = 1, #uniqueCrates do
+        local crateName = uniqueCrates[i]
+        if crateAutoToggles[crateName] == nil then
+            crateAutoToggles[crateName] = true
+        end
+        local isStateOn = crateAutoToggles[crateName]
+
+        local crateRow = Instance.new("Frame", crateFilterScroll)
+        crateRow.Size = UDim2.new(1, 0, 0, 24)
+        crateRow.BackgroundTransparency = 1
+
+        local crateBtn = Instance.new("TextButton", crateRow)
+        crateBtn.Size = UDim2.new(1, 0, 1, 0)
+        crateBtn.BackgroundColor3 = isStateOn and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+        crateBtn.BackgroundTransparency = 0.2
+        crateBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        crateBtn.TextSize = 11
+        crateBtn.Font = Enum.Font.SourceSansBold
+        crateBtn.Text = crateName .. ":" .. (isStateOn and "ON" or "OFF")
+        Instance.new("UICorner", crateBtn).CornerRadius = UDim.new(0, 4)
+
+        crateBtn.MouseButton1Click:Connect(function()
+            crateAutoToggles[crateName] = not crateAutoToggles[crateName]
+            local state = crateAutoToggles[crateName]
+            crateBtn.BackgroundColor3 = state and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+            crateBtn.Text = crateName .. ":" .. (state and "ON" or "OFF")
+            saveSettings()
+        end)
+    end
+end
+
+-- Background Loop: Auto Farm (Mengambil Crate Berdasarkan Urutan Rarity Tertinggi ke Terendah)
+local farmThread = task.spawn(function()
+    while true do
+        if autoFarmEnabled then
+            local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local farmedAny = false
+                
+                local children = FOLDER_PATH:GetChildren()
+                table.sort(children, function(a, b)
+                    local weightA = rarityWeights[getCrateRarity(a)] or 0
+                    local weightB = rarityWeights[getCrateRarity(b)] or 0
+                    if weightA ~= weightB then return weightA > weightB end
+                    
+                    local sizeA, sizeB = getCrateWeight(a), getCrateWeight(b)
+                    if sizeA ~= sizeB then return sizeA > sizeB end
+                    
+                    return getCrateName(a) < getCrateName(b)
+                end)
+
+                for i = 1, #children do
+                    local item = children[i]
+                    if not autoFarmEnabled then break end
+                    local crateName = getCrateName(item)
+                    local crateRarity = getCrateRarity(item)
+                    
+                    if rarityToggles[crateRarity] and (crateAutoToggles[crateName] ~= false) and hasActivePrompt(item) and getCratePart(item) then
+                        farmedAny = true
+                        processCrateCollection(item)
+                        break
+                    end
+                end
+                if not farmedAny then task.wait(0.1) end
+            else
+                task.wait(0.5)
+            end
+        else
+            task.wait(0.5)
+        end
+    end
+end)
+table.insert(getgenv().StealAnRich_Connections, farmThread)
+
+-- Background Loop: Deteksi Idle 7 Detik & Cek Gerakan Pemain sebelum Teleport ke Treadmill
+local treadmillIdleThread = task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if autoTreadmillEnabled and not isBusyWithCrate then
+            local character = LocalPlayer.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            
+            if humanoid and humanoid.MoveDirection.Magnitude > 0.1 then
+                lastActionTick = tick()
+            else
+                if (tick() - lastActionTick) >= 7 then
+                    local hasAvailableCrate = false
+                    if autoFarmEnabled then
+                        for _, item in ipairs(FOLDER_PATH:GetChildren()) do
+                            local crateRarity = getCrateRarity(item)
+                            local crateName = getCrateName(item)
+                            if rarityToggles[crateRarity] and (crateAutoToggles[crateName] ~= false) and hasActivePrompt(item) and getCratePart(item) then
+                                hasAvailableCrate = true
+                                break
+                            end
+                        end
+                    end
+
+                    if not hasAvailableCrate then
+                        local treadmillPart = nil
+                        local treadmillName = "PersonalTreadmill_" .. LocalPlayer.UserId
+                        for _, desc in ipairs(Workspace:GetDescendants()) do
+                            if desc.Name == treadmillName then
+                                if desc:IsA("BasePart") then
+                                    treadmillPart = desc
+                                    break
+                                elseif desc:IsA("Model") then
+                                    treadmillPart = desc.PrimaryPart or desc:FindFirstChildWhichIsA("BasePart")
+                                    if treadmillPart then break end
+                                end
+                            end
+                        end
+
+                        if treadmillPart and character and character:FindFirstChild("HumanoidRootPart") then
+                            local hrp = character.HumanoidRootPart
+                            if (hrp.Position - treadmillPart.Position).Magnitude > 5 then
+                                hrp.CFrame = treadmillPart.CFrame + Vector3.new(0, 3, 0)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+table.insert(getgenv().StealAnRich_Connections, treadmillIdleThread)
+
+local rarityListOrder = {"Divine", "Secret", "Cosmic", "Mythic", "Legendary", "Epic", "Rare", "Uncommon", "Common"}
+local rarityYPos = 0
+
+for i = 1, #rarityListOrder do
+    local rarityName = rarityListOrder[i]
+    local isToggled = rarityToggles[rarityName]
+    local rBtn = Instance.new("TextButton", rarityScroll)
+    rBtn.Size = UDim2.new(1, 0, 0, 24)
+    rBtn.Position = UDim2.new(0, 0, 0, rarityYPos)
+    rBtn.BackgroundColor3 = isToggled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+    rBtn.BackgroundTransparency = 0.2
+    rBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    rBtn.TextSize = 11
+    rBtn.Font = Enum.Font.SourceSansBold
+    rBtn.Text = rarityName .. ":" .. (isToggled and "ON" or "OFF")
+    Instance.new("UICorner", rBtn).CornerRadius = UDim.new(0, 4)
+
+    rBtn.MouseButton1Click:Connect(function()
+        rarityToggles[rarityName] = not rarityToggles[rarityName]
+        local state = rarityToggles[rarityName]
+        rBtn.BackgroundColor3 = state and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+        rBtn.Text = rarityName .. ":" .. (state and "ON" or "OFF")
+        
+        saveSettings()
+        updateUIList()
+        refreshAllESP()
+        updateCrateFilterUI()
+    end)
+
+    rarityYPos = rarityYPos + 28
+end
+
+toggleButton.Text = globalEspEnabled and "ESP: ON" or "ESP: OFF"
+toggleButton.BackgroundColor3 = globalEspEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+
+autoFarmButton.Text = autoFarmEnabled and "Auto Farm: ON" or "Auto Farm: OFF"
+autoFarmButton.BackgroundColor3 = autoFarmEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+
+feedToggleButton.Text = feedAreaEnabled and "Feed Area: ON" or "Feed Area: OFF"
+feedToggleButton.BackgroundColor3 = feedAreaEnabled and Color3.fromRGB(230, 126, 34) or Color3.fromRGB(120, 0, 0)
+
+autoHopButton.Text = autoHopEnabled and "Auto Execute: ON" or "Auto Execute: OFF"
+autoHopButton.BackgroundColor3 = autoHopEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+
+autoTreadmillButton.Text = autoTreadmillEnabled and "Auto Treadmill: ON" or "Auto Treadmill: OFF"
+autoTreadmillButton.BackgroundColor3 = autoTreadmillEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+
+floatingIcon.MouseButton1Click:Connect(function() mainFrame.Visible = not mainFrame.Visible end)
+
+closeButton.MouseButton1Click:Connect(function()
+    globalEspEnabled = false
+    autoFarmEnabled = false
+    feedAreaEnabled = false
+    autoTreadmillEnabled = false
+    
+    clearAllESP()
+    screenGui:Destroy()
+end)
+
+hideButton.MouseButton1Click:Connect(function() mainFrame.Visible = false end)
+
+toggleButton.MouseButton1Click:Connect(function()
+    globalEspEnabled = not globalEspEnabled
+    toggleButton.Text = globalEspEnabled and "ESP: ON" or "ESP: OFF"
+    toggleButton.BackgroundColor3 = globalEspEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+    if not globalEspEnabled then clearAllESP() end
+    saveSettings()
+    refreshAllESP()
+end)
+
+setBaseButton.MouseButton1Click:Connect(function()
+    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        customBasePosition = hrp.Position
+        setBaseButton.Text = "Base Saved!"
+        saveSettings()
+        task.wait(1)
+        setBaseButton.Text = "Set Base Pos"
+    end
+end)
+
+tpBaseButton.MouseButton1Click:Connect(function()
+    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if hrp and customBasePosition then
+        hrp.CFrame = CFrame.new(customBasePosition)
+    end
+end)
+
+autoFarmButton.MouseButton1Click:Connect(function()
+    autoFarmEnabled = not autoFarmEnabled
+    autoFarmButton.Text = autoFarmEnabled and "Auto Farm: ON" or "Auto Farm: OFF"
+    autoFarmButton.BackgroundColor3 = autoFarmEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+    saveSettings()
+end)
+
+feedToggleButton.MouseButton1Click:Connect(function()
+    feedAreaEnabled = not feedAreaEnabled
+    feedToggleButton.Text = feedAreaEnabled and "Feed Area: ON" or "Feed Area: OFF"
+    feedToggleButton.BackgroundColor3 = feedAreaEnabled and Color3.fromRGB(230, 126, 34) or Color3.fromRGB(120, 0, 0)
+    saveSettings()
+end)
+
+setPosButton.MouseButton1Click:Connect(function()
+    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        feedTargetPosition = hrp.Position
+        setPosButton.Text = "Pos Saved!"
+        saveSettings()
+        task.wait(1)
+        setPosButton.Text = "Set Feed Pos"
+    end
+end)
+
+hopButton.MouseButton1Click:Connect(hopServer)
+autoHopButton.MouseButton1Click:Connect(function()
+    autoHopEnabled = not autoHopEnabled
+    autoHopButton.Text = autoHopEnabled and "Auto Execute: ON" or "Auto Execute: OFF"
+    autoHopButton.BackgroundColor3 = autoHopEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+    saveSettings()
+end)
+
+autoTreadmillButton.MouseButton1Click:Connect(function()
+    autoTreadmillEnabled = not autoTreadmillEnabled
+    autoTreadmillButton.Text = autoTreadmillEnabled and "Auto Treadmill: ON" or "Auto Treadmill: OFF"
+    autoTreadmillButton.BackgroundColor3 = autoTreadmillEnabled and Color3.fromRGB(0, 170, 255) or Color3.fromRGB(120, 0, 0)
+    saveSettings()
+end)
+
+local childAddConn = FOLDER_PATH.ChildAdded:Connect(function(item)
+    task.wait(0.05)
+    instantPrompt(item)
+    if globalEspEnabled then setupESP(item) end
+    updateUIList()
+    updateCrateFilterUI()
+end)
+table.insert(getgenv().StealAnRich_Connections, childAddConn)
+
+local childRemConn = FOLDER_PATH.ChildRemoved:Connect(function()
+    updateUIList()
+    updateCrateFilterUI()
+end)
+table.insert(getgenv().StealAnRich_Connections, childRemConn)
+
+clearAllESP()
+updateUIList()
+updateCrateFilterUI()
+if globalEspEnabled then refreshAllESP() end
